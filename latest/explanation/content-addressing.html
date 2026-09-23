@@ -187,10 +187,11 @@
                         <h1 id="content-addressing"><a class="header" href="#content-addressing">Content Addressing</a></h1>
 <p>Every array is identified by the SHA-256 hash of its contents, not by a name or an ID. Two series
 with byte-identical values therefore resolve to the same hash and are stored exactly once. This is
-the mechanism that lets many <a href="./data-model.html#keys">keys</a> share one underlying array.</p>
+the mechanism that lets many <a href="./data-model.html#identity">series</a> share one underlying array.</p>
 <h2 id="the-array-hash"><a class="header" href="#the-array-hash">The Array Hash</a></h2>
 <p><code>array_hash</code> produces a deterministic 32-byte digest from a
-<a href="./data-model.html#typed-n-dimensional-arrays"><code>TypedArray</code></a>. The hashed byte stream is, in order:</p>
+<a href="./time-series-types.html#typed-n-dimensional-arrays"><code>TypedArray</code></a>. The hashed byte stream is, in
+order:</p>
 <ol>
 <li>A <strong>dtype tag</strong>: the dtype name (<code>f64</code>, <code>f32</code>, <code>i64</code>, <code>i32</code>, <code>i16</code>, <code>i8</code>, <code>u64</code>, <code>u32</code>, <code>u16</code>,
 <code>u8</code>, <code>bool</code>) followed by a NUL byte.</li>
@@ -243,16 +244,20 @@ was derived from and has exactly the same features, so <code>transform_single_ti
 <strong>zero</strong> feature rows — it reuses the set the source series already stored, just as it reuses the
 source's array.</p>
 <h2 id="the-timestamps-hash"><a class="header" href="#the-timestamps-hash">The Timestamps Hash</a></h2>
-<p>A <code>NonSequentialTimeSeries</code> carries its timestamps explicitly, and those are content-addressed too,
-by <code>timestamps_hash</code>: a domain tag followed by the vector's canonical encoding — the same bytes the
-catalog stores, so the hash addresses the stored form rather than a second serialization of it. Two
-vectors hash equal exactly when they hold the same instants in the same order.</p>
+<p>A <code>NonSequentialTimeSeries</code> carries its timestamps explicitly — as does a <code>PersistentTimeSeries</code>,
+whose breakpoints are the same thing under a different reading — and those are content-addressed
+too, by <code>timestamps_hash</code>: a domain tag, the count, then each instant as a unix millisecond count —
+the same values the store writes, so the hash addresses the stored form rather than a second
+serialization of it. Two vectors hash equal exactly when they hold the same instants in the same
+order.</p>
 <p>Like the features hash, it does double duty:</p>
 <ul>
-<li><strong>It keys the stored vector.</strong> The <code>timestamp_sets</code> table is keyed by it, so a time axis shared by
-a thousand irregular series is stored <strong>once</strong>. Sharing is again the common case, not the rare
-one: irregular series in this domain sit on a schedule — outage windows, market intervals, event
-times — that many components observe together.</li>
+<li><strong>It names the stored vector.</strong> Each distinct time axis is one <code>tsv_{timestamps_hash}</code> dataset in
+the HDF5 file, so an axis shared by a thousand irregular series is stored <strong>once</strong>. Sharing is
+again the common case, not the rare one: irregular series in this domain sit on a schedule —
+outage windows, market intervals, event times — that many components observe together. Unlike the
+features hash, this one addresses something in the <em>array</em> half of the artifact: a timestamp
+vector is data, and the catalog holds only its hash.</li>
 <li><strong>It is the cohort key of the packed array layout.</strong> Column-packing is only meaningful for arrays
 on a common time axis, since the chunking is timestamp-major; the interned hash is precisely the
 answer to "do these two series share one?", so the arrays of a cohort pool into one
@@ -282,7 +287,7 @@ metadata cost scales with the number of <em>associations</em>. A profile shared 
 costs one array, one feature set, and a thousand small rows.</p>
 <h2 id="deletion-is-reference-counted"><a class="header" href="#deletion-is-reference-counted">Deletion is Reference-Counted</a></h2>
 <p>Because arrays are shared, deleting an association cannot blindly delete its array. On
-<code>remove_time_series</code> (and <code>clear_time_series</code>), <code>Store</code>:</p>
+<code>remove_by_ids</code> (and <code>clear_time_series</code>), <code>Store</code>:</p>
 <ol>
 <li>Deletes the matching association rows inside a SQLite transaction, collecting their
 <code>data_hash</code>es.</li>
@@ -318,20 +323,20 @@ its array's <code>data_hash</code>, so a caller can group series by that hash to
 the same stored array — without reading any array bytes. Two cases land in the same group: arrays
 that were deduplicated because their content was identical, and a <code>SingleTimeSeries</code> together with
 any <code>DeterministicSingleTimeSeries</code> derived from it (the DST shares the backing array).</p>
-<p>In the Julia binding, <code>list_array_groups</code> returns <code>ArrayGroupRow</code>s — the <code>list_keys</code> fields plus a
-<code>data_hash</code> field (the 32 raw bytes, which hash and compare by content and so work directly as a
-<code>Dict</code> key); group by it to find the shared sets. <code>count_array_references</code> reports, for one hash,
-how many <code>SingleTimeSeries</code> and <code>DeterministicSingleTimeSeries</code> associations point at it.</p>
-<pre><code class="language-julia">groups = Dict{Vector{UInt8}, Vector{ArrayGroupRow}}()
-for row in list_array_groups(store)
+<p>In the Julia binding, <code>list_metadata</code> returns <code>TimeSeriesMetadata</code> rows, each carrying a <code>data_hash</code>
+field (the 32 raw bytes, which hash and compare by content and so work directly as a <code>Dict</code> key);
+group by it to find the shared sets. <code>count_array_references</code> reports, for one hash, how many
+<code>SingleTimeSeries</code> and <code>DeterministicSingleTimeSeries</code> associations point at it.</p>
+<pre><code class="language-julia">groups = Dict{Vector{UInt8}, Vector{TimeSeriesMetadata}}()
+for row in list_metadata(store)
     push!(get!(groups, row.data_hash, eltype(values(groups))[]), row)
 end
 shared = filter(((_, rows),) -&gt; length(rows) &gt; 1, groups)   # arrays referenced by &gt;1 series
 </code></pre>
 <p>This read-side view is what lets a downstream caller collapse work across owners that share data.
-The <a href="../reference/julia-api.html#forecastreader"><code>ForecastReader</code></a> builds on the same grouping
-internally: forecasts that share an array (and read plan) are read from disk <strong>once per timestamp</strong>
-no matter how many components reference them — see
+The <a href="./readers.html"><code>ForecastReader</code></a> builds on the same grouping internally: forecasts that share an
+array (and read plan) are read from disk <strong>once per timestamp</strong> no matter how many components
+reference them — see
 <a href="../reference/julia-api.html#window-read-deduplication">Window-read deduplication</a>. (This is exactly
 how InfrastructureSystems.jl backs its own <code>get_shared_time_series</code> and forecast reader.)</p>
 <h2 id="stability-is-a-contract"><a class="header" href="#stability-is-a-contract">Stability is a Contract</a></h2>
@@ -346,29 +351,34 @@ rules can therefore break the format without breaking that test — the reasonin
 is the contract.</p>
 <h2 id="integrity-verification"><a class="header" href="#integrity-verification">Integrity Verification</a></h2>
 <p>Because the stored hash and the stored data are independent on disk, they can be cross-checked.
-<code>verify_integrity</code> walks every indexed column, recomputes <code>array_hash</code> from the stored values, and
-reports any mismatch between the recorded hash and the recomputed one — detecting silent corruption.
-See <a href="../reference/rust-api.html#store"><code>verify_integrity</code></a>.</p>
+<code>verify_integrity</code> takes the catalog as the statement of what should be there, then checks the HDF5
+half against it: it collects every array and every explicit timestamp vector the catalog references,
+reads each one back, recomputes <code>array_hash</code> / <code>timestamps_hash</code> from the stored values, and reports
+any mismatch between the recorded hash and the recomputed one — detecting silent corruption. A
+reference the file cannot satisfy is reported too, as a dangling one. See
+<a href="../reference/rust-api.html#store"><code>verify_integrity</code></a>.</p>
 <h3 id="what-it-does-not-cover"><a class="header" href="#what-it-does-not-cover">What it does not cover</a></h3>
-<p>The check is scoped to the <strong>array half</strong> of the store. It reads what the HDF5 side knows about and
-rehashes it; it never opens the SQLite catalog. A clean report is therefore a statement about the
-arrays, not about the store as a whole. Three things fall outside it:</p>
+<p>The check runs from the catalog into the HDF5 file, and only in that direction. It never checks the
+catalog against <em>itself</em>, so a clean report is a statement about the stored content, not about the
+store as a whole. Three things fall outside it:</p>
 <ul>
-<li>a <code>data_hash</code> in the catalog that names no stored array — a truncated or corrupted catalog, or a
-catalog paired with the wrong <code>.h5</code> file. Every read of the affected key fails, and
-<code>verify_integrity</code> reports nothing.</li>
-<li>a catalog row whose <code>dtype</code>, <code>element_shape</code>, or <code>length</code> misdescribes the array it points at.</li>
+<li>a catalog row whose <code>dtype</code>, <code>element_shape</code>, or <code>length</code> misdescribes the array it points at. The
+hash addresses the array's own content, so an array that matches its hash passes the check while
+the row goes on lying about it.</li>
 <li>a missing catalog entirely. The two artifacts are one logical store, but nothing enforces that:
 opening read-write with the <code>.sqlite</code> half deleted silently recreates it empty, and the resulting
-store — zero time series, every array still present and now unreachable — verifies clean.</li>
+store — zero time series, every array still present and now unreachable — verifies clean, because
+a catalog that references nothing is a clean bill of health here.</li>
+<li>anything the catalog does not reference. The sweep never reaches it, whatever state it is in; an
+unreachable array is the expected state after a delete, and <code>compact</code> is what reports it.</li>
 </ul>
-<p>This is a deliberate scope rather than an oversight: the array side is where silent bit-level
-corruption happens, and it is the half no other call examines. The catalog has its own purpose-built
-checks — <code>check_static_consistency</code> for per-resolution grid agreement, and <code>compact</code> for the
-unreachable arrays and feature sets a delete leaves behind, which it reclaims and reports (an
-expected state, documented in the <a href="../reference/file-format.html">file format</a>, not corruption).
-SQLite also enforces a good deal itself: the <code>NOT NULL</code> and <code>CHECK</code> constraints, and the two unique
-indexes that guarantee identity uniqueness.</p>
+<p>This is a deliberate scope rather than an oversight: content corruption is what happens silently,
+and the catalog has its own purpose-built checks — <code>check_static_consistency</code> for per-resolution
+grid agreement, and <code>compact</code> for the unreachable arrays and feature sets a delete leaves behind,
+which it reclaims and reports (an expected state, documented in the
+<a href="../reference/file-format.html">file format</a>, not corruption). SQLite also enforces a good deal
+itself: the <code>NOT NULL</code> and <code>CHECK</code> constraints, and the two unique indexes that guarantee identity
+uniqueness.</p>
 <p>If you need end-to-end assurance that a copied or restored store is intact, the operational rule in
 the <a href="../reference/file-format.html">file format</a> is the one that matters: move, copy, and delete the
 <code>.h5</code> and its <code>.sqlite</code> together.</p>

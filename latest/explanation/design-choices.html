@@ -187,24 +187,30 @@
                         <h1 id="design-choices"><a class="header" href="#design-choices">Design Choices</a></h1>
 <p>infrastore is a foundation library. End users rarely call it directly — they reach it through a
 parent package such as
-<a href="https://github.com/NREL-Sienna/InfrastructureSystems.jl">InfrastructureSystems.jl</a> (IS.jl) or
+<a href="https://github.com/Sienna-Platform/InfrastructureSystems.jl">InfrastructureSystems.jl</a> (IS.jl) or
 <a href="https://github.com/natlabrockies/infrasys">infrasys</a>, which embed infrastore to persist the
 time-series data behind their component models. This page records the decisions that shape the API
 and the on-disk format, and the reasoning behind them, so that developers of those parent packages
-understand what infrastore optimizes for — and, just as importantly, what it deliberately does not.</p>
+understand what infrastore optimizes for — and, just as importantly, what it deliberately does not.
+The practical counterpart — which calls a parent package should make, and in what order — is
+<a href="../guides/embedding.html">Embedding in a Parent Package</a>.</p>
 <h2 id="data-orientation-optimize-for-reading-every-component-at-one-timestamp"><a class="header" href="#data-orientation-optimize-for-reading-every-component-at-one-timestamp">Data Orientation: Optimize for Reading Every Component at One Timestamp</a></h2>
 <p><strong>The decision.</strong> In the HDF5 file, <code>SingleTimeSeries</code> arrays that share a
 <code>(dtype, element_shape, length, resolution)</code> are packed as columns of one dataset: <strong>columns are
-series, rows are timesteps</strong>, and the HDF5 chunking is <code>(1, cols, *element_shape)</code> so that a single
-chunk holds one timestamp across every column. We optimize for reading <strong>all components' values at a
+series, rows are timesteps</strong>, and the HDF5 chunking spans the whole width —
+<code>(rows, cols, *element_shape)</code>, one row unless the dataset is narrow enough that a single timestamp
+row would make an uneconomically small chunk
+(<a href="../reference/file-format.html#packed-mode">file format</a>). A chunk therefore holds one timestamp, or
+a few consecutive ones, across every column. We optimize for reading <strong>all components' values at a
 given timestamp</strong>, and accept that reading <strong>one component's entire array</strong> is comparatively slow.</p>
 <p><strong>Why.</strong> The workload that matters is simulation. A production-cost or power-flow model steps
 through time and, at each step, needs the value of every generator, load, and branch for that one
-timestamp — a slice <em>across</em> series, not <em>down</em> one. With this layout that slice is a single chunk
-read; the <a href="./storage-model.html#the-array-side-hdf5"><code>ForecastReader</code> / <code>StaticReader</code></a> columnar
-surface is built directly on it. The inverse access — pulling one component's full history — has to
-touch every chunk band and is slow by design. That trade is deliberate: the simulation read path is
-the hot one, and it is the one parent packages hand to their users.</p>
+timestamp — a slice <em>across</em> series, not <em>down</em> one. With this layout that slice is one chunk read
+per dataset, and a sweep of them costs the same whatever the chunk's row count, since it visits
+every chunk anyway; the <a href="./readers.html"><code>ForecastReader</code> / <code>StaticReader</code></a> columnar surface is built
+directly on it. The inverse access — pulling one component's full history — has to touch every chunk
+band and is slow by design. That trade is deliberate: the simulation read path is the hot one, and
+it is the one parent packages hand to their users.</p>
 <p><strong>What this means for parent-package developers.</strong></p>
 <ul>
 <li>Lay out bulk writes so that series sharing a shape land in the same dataset — that is what fills
@@ -238,7 +244,7 @@ the entire year of windows.</p>
 <ul>
 <li><strong>A window sweep is cheap; naive per-window reads are not, unless you go through the reader.</strong>
 Because a chunk is the decompression unit, reading a single window still pulls its whole block.
-The <a href="./storage-model.html"><code>ForecastReader</code></a> sizes its in-memory cache to that same block width, so
+The <a href="./readers.html"><code>ForecastReader</code></a> sizes its in-memory cache to that same block width, so
 stepping the window timeline decompresses each block exactly once. Reach for <code>ForecastReader</code> (or
 read the whole array once and index it) rather than issuing an independent whole-array read per
 window — the latter re-decompresses overlapping data.</li>
@@ -294,12 +300,114 @@ see its uncommitted writes, because they go through the same connection — so a
 staging overlay to give a caller read-your-own-writes. And nesting is free: each level is a SQLite
 savepoint, so an inner failure unwinds only its own work and leaves the enclosing transaction
 usable.</p>
+<p><strong>Append-only also means "not yet written".</strong> A packed single add outside a transaction fills one
+slot of a thousand-column growth pool, and because that pool is chunked one timestamp row across
+every column, filling one column rewrites every chunk in it. Inside a transaction that write is owed
+to nobody until the outermost commit, so it is buffered per pool instead and the buffered arrays are
+written together with the same block writer a bulk add uses — at the commit, when a read needs one
+of them to have a physical position, or when the buffer hits one of the bounds below. A loop of
+single adds inside one transaction therefore produces the file one bulk add of the same items
+produces: same dataset names, same widths, same chunking. Nothing about the format changes; these
+are layouts the bulk path already wrote.</p>
+<p>Two edges keep that from being a worse trade than the one it replaces. <strong>A block of one is not a
+block</strong>: a span holding a single array for a pool fills a growth-pool slot, because a dataset sized
+to one column is chunked <code>(1, 1)</code> and gives a scalar <code>f64</code> series an eight-byte chunk per timestep,
+whose per-chunk overhead dwarfs the data — the same reason <code>add_time_series_bulk</code> sends a batch of
+one down the single-add path. That matters because "several operations atomic together" is most
+often a removal and its replacement, not an ingest. The same rule settles whether an irregular
+series packs with a cohort or stands alone: that is a bet on the axis being shared, and inside a
+span only the block knows the answer, so a cohort added one series at a time pools exactly as the
+bulk add of it does. And <strong>the buffer is bounded</strong>, per pool at the width the block writer spills a
+batch at and across every pool at a fixed byte ceiling; crossing either writes a block out early,
+which costs an extra dataset and nothing else. The per-pool bound is the chunk budget rather than
+the growth pool's thousand columns because a bulk add inside a transaction is buffered too, and a
+narrower cap gave it ten times the datasets — and a columnar read ten times the chunks — of the same
+add outside one.</p>
+<p>One failure the mechanism cannot see coming is SQLite ending the transaction itself: a statement
+that fails on a full disk or an I/O error can roll the whole transaction back, savepoints included,
+and the store's bookkeeping does not learn of it. So the store reads it off the connection after the
+fact — nesting levels still recorded while the connection is back in autocommit — and from then on
+refuses every write and the commit until <code>rollback_transaction</code> discards the dead transaction, every
+level at once. The alternative, letting the next write open an implicit transaction of its own and
+commit on its own, would make part of the span durable behind the caller's back.</p>
 <p>The costs are real and bound where this is worth using. A transaction holds the SQLite write lock
 until it finishes, so a concurrent writer on the same artifact blocks and then fails on its busy
-timeout. And a transaction is not a substitute for batching: block-sized HDF5 writes and feature-set
-dedup come from <code>bulk_add</code>, and a loop of single adds gets neither just because it is wrapped in a
-transaction. The two compose — batch each operation, and use a transaction when several of them must
-be atomic together.</p>
+timeout. The buffer holds its not-yet-written arrays in memory — the same memory the equivalent bulk
+add allocates, bounded per pool by the width it spills at. And a transaction still does not replace
+batching for everything: feature-set dedup across a batch comes from <code>bulk_add</code>, which is also the
+direct spelling when the whole cohort is already in hand as a list. The two compose — batch each
+operation, and use a transaction when several of them must be atomic together.</p>
+<h2 id="upgrade-a-store-in-place-rather-than-bricking-it"><a class="header" href="#upgrade-a-store-in-place-rather-than-bricking-it">Upgrade a Store In Place Rather Than Bricking It</a></h2>
+<p><code>DATA_FORMAT_VERSION</code> used to be checked by strict equality on open, which made every bump a wall:
+"re-create the store." It was bumped six times between 0.12 and 0.19 and each one meant exactly
+that. The reason it had to be a wall is that the catalog DDL is <code>CREATE TABLE IF NOT EXISTS</code> —
+idempotent, so a new <em>table</em> or <em>index</em> lands on an existing store for free, but not
+version-agnostic: it will not alter a table that already exists, so a new column or a changed
+<code>CHECK</code> never reaches an old catalog at all.</p>
+<p>This release replaces the wall with a <strong>three-tier compatibility model</strong> plus a migration ladder.</p>
+<h3 id="two-revisions-answering-different-questions"><a class="header" href="#two-revisions-answering-different-questions">Two revisions, answering different questions</a></h3>
+<ul>
+<li><strong><code>DATA_FORMAT_VERSION</code></strong> describes the <strong>artifact as a whole</strong> and is stamped on the HDF5 root.
+It moves for anything that changes the meaning of bytes already on disk: the array layout, the
+dtype encoding, the timestamp encoding, a hash domain.</li>
+<li><strong><code>CATALOG_SCHEMA_REVISION</code></strong> describes the <strong>SQLite catalog</strong> alone and lives in its
+<code>schema_version</code> table. <strong>Any catalog change the idempotent DDL cannot make to an existing table —
+a new column, a changed <code>CHECK</code>, a rebuilt table, a backfill — needs a <code>CATALOG_SCHEMA_REVISION</code>
+bump plus an append-only entry in <code>MIGRATIONS</code>.</strong></li>
+</ul>
+<p><code>MIN_UPGRADABLE_VERSION</code> says how far back the ladder reaches. A stamp between it and
+<code>DATA_FORMAT_VERSION</code> is <code>Upgradable</code>; anything older, anything newer, and anything unparseable is
+<code>Incompatible</code> and is refused exactly as before. When a bump genuinely does strand older stores,
+<code>MIN_UPGRADABLE_VERSION</code> is raised to match it; when the ladder can absorb it, it is left alone.</p>
+<h3 id="a-writable-open-upgrades-a-read-only-open-reports"><a class="header" href="#a-writable-open-upgrades-a-read-only-open-reports">A writable open upgrades; a read-only open reports</a></h3>
+<p>Opening a store for <strong>writing</strong> runs every migration above the catalog's recorded revision, in
+order, each in its own transaction. Opening it <strong>read-only</strong> cannot change anything, so it reports
+<code>CatalogMigrationRequired</code> — an error that names the remedy (open it once for writing) instead of a
+raw <code>no such column</code> from inside some later query. This is what a read-only consumer such as the
+gRPC server now sees against a store that has not yet been upgraded.</p>
+<p>A catalog written by a <em>newer</em> build is <code>CatalogTooNew</code> and is refused in both directions. There is
+no downgrade path, and this build's DDL and ladder both describe an older shape.</p>
+<h3 id="the-ordering-that-makes-it-safe"><a class="header" href="#the-ordering-that-makes-it-safe">The ordering that makes it safe</a></h3>
+<p>Three steps, and each one is load-bearing:</p>
+<ol>
+<li>Open the HDF5 half and evaluate its version stamp. This must come first so a store too old to
+migrate reports <code>IncompatibleFormat</code> rather than a confusing SQLite error, and so a bad path does
+not leave a freshly created empty <code>.sqlite</code> behind. An upgradable stamp is <em>noted</em>, not yet
+rewritten.</li>
+<li>Open the catalog, which is where the ladder runs.</li>
+<li>Only if (2) succeeded, and only for a writable open, re-stamp the HDF5 half.</li>
+</ol>
+<p>The two stamps cannot be written atomically together, so the order decides which half is ahead when
+something fails in between. Catalog-first leaves a migrated catalog under an older array-file stamp:
+an older build then opens the store and simply never writes a row of a type it does not know, which
+is harmless. The reverse would leave a store <em>claiming</em> the new format over an un-migrated catalog —
+the exact failure the ladder exists to eliminate.</p>
+<p>Migration is <strong>not a save</strong>: the paired generation stamps that pair the two halves are carried
+across untouched.</p>
+<h3 id="append-only-never-edited"><a class="header" href="#append-only-never-edited">Append-only, never edited</a></h3>
+<p>A landed <code>MIGRATIONS</code> entry is frozen. Stores in the wild have already run it, so editing it changes
+nothing for them and silently diverges the shape a fresh store gets from the shape an upgraded one
+gets. Add a new entry instead. For the same reason each migration carries a <strong>frozen snapshot</strong> of
+the table shape it produces rather than deriving it from the live DDL, which will keep moving.</p>
+<p>Revision 1 is <em>defined</em> as whatever a pre-ladder build stamped — which is exactly what every
+existing store already says, since the <code>schema_version</code> table was seeded with a literal <code>1</code> and
+never read back. That is why the ladder needs no detection heuristic. It is deliberately not a claim
+about one particular table shape, though: nothing stamped a revision while the catalog was still
+moving, so <code>1</code> spans several, and a migration must tolerate any of them. The ladder starts there
+rather than trying to resurrect the 0.12–0.16 formats, which changed the meaning of bytes on disk
+and are still rejected outright.</p>
+<h3 id="the-first-rung"><a class="header" href="#the-first-rung">The first rung</a></h3>
+<p>Revision 2 widens the <code>time_series_associations</code> <code>time_series_type</code> <code>CHECK</code> from <code>BETWEEN 0 AND 5</code>
+to <code>&gt;= 0</code>. <code>TimeSeriesType::from_code</code> is the real gate on that domain and runs on every write and
+every read, so the numeric bound bought nothing SQLite had to enforce — while turning the eventual
+appending of a seventh type into a table rebuild. Moving the domain onto the enum leaves the <code>CHECK</code>
+as a non-negativity test, which still refuses a corrupted value.</p>
+<p>SQLite has no <code>ALTER TABLE … DROP CONSTRAINT</code>, so applying it <em>is</em> the table rebuild, and the
+rebuild is what makes the two subtle parts of the ladder concrete: the <code>time_series_readable</code> view
+has to be dropped first (SQLite refuses to drop a table a view still names), and the <code>AUTOINCREMENT</code>
+high-water mark has to be carried across by hand, because <code>DROP TABLE</code> takes the old table's
+<code>sqlite_sequence</code> row with it and the copy would restart the counter at <code>max(id)</code> — handing back an
+id a deleted row already used, which is the one thing <code>AUTOINCREMENT</code> is there to prevent.</p>
 
                     </main>
 
@@ -309,7 +417,7 @@ be atomic together.</p>
                                 <i class="fa fa-angle-left"></i>
                             </a>
 
-                            <a rel="next prefetch" href="../explanation/data-model.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../explanation/time-series-types.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <i class="fa fa-angle-right"></i>
                             </a>
 
@@ -323,7 +431,7 @@ be atomic together.</p>
                         <i class="fa fa-angle-left"></i>
                     </a>
 
-                    <a rel="next prefetch" href="../explanation/data-model.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../explanation/time-series-types.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <i class="fa fa-angle-right"></i>
                     </a>
             </nav>

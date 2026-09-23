@@ -186,9 +186,13 @@
                     <main>
                         <h1 id="data-model"><a class="header" href="#data-model">Data Model</a></h1>
 <p>The data model mirrors the time-series concepts originally developed in
-<a href="https://github.com/NREL-Sienna/InfrastructureSystems.jl">InfrastructureSystems.jl</a>: a <strong>component</strong>
-(or supplemental attribute) owns one or more named time series, and each time series may exist in
-several variants distinguished by <strong>features</strong>.</p>
+<a href="https://github.com/Sienna-Platform/InfrastructureSystems.jl">InfrastructureSystems.jl</a>: a
+<strong>component</strong> (or supplemental attribute) owns one or more named time series, and each time series
+may exist in several variants distinguished by <strong>features</strong>.</p>
+<p>This page covers the <strong>catalog</strong> side of that — who owns a series, what distinguishes two series
+that share a name, how a row is filed, and how it is addressed once stored. Two neighbors cover the
+rest: <a href="./time-series-types.html">Time-Series Types</a> for what the six types mean and which to reach
+for, and <a href="./time-references.html">Time References</a> for how a series' timestamps are spelled.</p>
 <h2 id="owners"><a class="header" href="#owners">Owners</a></h2>
 <p>Every time series belongs to an owner, identified by three fields:</p>
 <div class="table-wrapper"><table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
@@ -202,121 +206,7 @@ several variants distinguished by <strong>features</strong>.</p>
 <code>owner_type</code> is descriptive. Component and supplemental-attribute integer-id streams are
 independent, so the same <code>owner_id</code> can name a component <strong>and</strong> a supplemental attribute at once —
 the category disambiguates them, keeping the two owners' series distinct. Owner-scoped operations
-therefore take the category alongside the id (see <a href="#keys">Keys</a>).</p>
-<h2 id="time-series-types"><a class="header" href="#time-series-types">Time-Series Types</a></h2>
-<p>The data model defines six time-series types, all present in the <code>TimeSeriesType</code> enum and the
-metadata schema. Both static series types are implemented across every interface. The four forecast
-types support reading values across the Rust core, the C ABI, Python, Julia, and gRPC. Dense
-forecasts are written through the generic <code>add_time_series</code> across the Rust core, Python, and Julia
-(the C ABI keeps the per-type <code>infrastore_store_add_forecast</code> / <code>infrastore_store_add_probabilistic</code>
-transport functions), and <code>DeterministicSingleTimeSeries</code> is derived from stored <code>SingleTimeSeries</code>
-via <code>transform_single_time_series</code> (gRPC stays read-only):</p>
-<div class="table-wrapper"><table><thead><tr><th>Type</th><th>Write path</th><th>Description</th></tr></thead><tbody>
-<tr><td><code>SingleTimeSeries</code></td><td><code>add_time_series</code></td><td>One array sampled at a fixed resolution</td></tr>
-<tr><td><code>NonSequentialTimeSeries</code></td><td><code>add_time_series</code></td><td>Values at explicit, irregular timestamps</td></tr>
-<tr><td><code>Deterministic</code></td><td><code>add_time_series</code></td><td>Forecast: a <code>(horizon × count)</code> window matrix</td></tr>
-<tr><td><code>DeterministicSingleTimeSeries</code></td><td>derived by <code>transform_single_time_series</code></td><td>Forecast view over an underlying <code>SingleTimeSeries</code></td></tr>
-<tr><td><code>Probabilistic</code></td><td><code>add_time_series</code></td><td>Forecast with percentile bands</td></tr>
-<tr><td><code>Scenarios</code></td><td><code>add_time_series</code></td><td>Forecast with discrete scenarios</td></tr>
-</tbody></table>
-</div>
-<p>All six types can be <strong>read</strong> from every interface: the Rust core, the C ABI, Python, Julia, the
-<code>infrastore</code> CLI, and the gRPC server. The <strong>write</strong> paths in the table are available in the Rust
-core, the C ABI, Python, Julia, and the CLI — never over gRPC, whose service is read-only. And no
-interface adds a <code>DeterministicSingleTimeSeries</code> directly: it only ever comes into existence by
-transforming a stored <code>SingleTimeSeries</code>.</p>
-<p><strong><code>DeterministicSingleTimeSeries</code> is a storage-level view, and reads always return a
-<code>Deterministic</code>.</strong> This is by design in every binding: <code>TimeSeriesData</code> has no
-<code>DeterministicSingleTimeSeries</code> variant, and a read synthesizes the windowed <code>Deterministic</code> from
-the underlying static array without copying it. The <code>DeterministicSingleTimeSeries</code> tag stays
-visible in <em>catalog</em> surfaces — keys, metadata rows, counts, summaries — so callers can see which of
-their forecasts are synthetic, and can address, copy, or remove the association.</p>
-<p>It is never something you must <em>ask for</em>. <strong>A request for <code>Deterministic</code> matches both storage
-forms</strong> — in reads, key resolution, catalog filters, and reader builds alike — so which one a store
-holds stays an internal detail. Requesting <code>DeterministicSingleTimeSeries</code> narrows to the derived
-form, which is how a caller audits what it has. This mirrors InfrastructureSystems.jl, where a
-<code>Deterministic</code> request lowers to both concrete type names.</p>
-<p>Reading forecast <em>values</em> is wired across the Rust core, the C ABI, Python, Julia, and gRPC. Writing
-dense forecasts goes through the generic <code>add_time_series</code> (a <code>Deterministic</code>, <code>Probabilistic</code>, or
-<code>Scenarios</code> object) in the Rust core, Python, and Julia, with the C ABI exposing the per-type
-<code>infrastore_store_add_forecast</code> / <code>infrastore_store_add_probabilistic</code> transport; a
-<code>DeterministicSingleTimeSeries</code> is produced by <code>transform_single_time_series</code>. The read-only gRPC
-server serves forecast reads but does not accept writes. See <a href="#forecasts">Forecasts</a> below.</p>
-<h3 id="nonsequentialtimeseries"><a class="header" href="#nonsequentialtimeseries"><code>NonSequentialTimeSeries</code></a></h3>
-<p>A <code>NonSequentialTimeSeries</code> pairs each value with an explicit UTC timestamp. Timestamps must be
-strictly increasing and their count must match the data length.</p>
-<p>The timestamp vector is stored in the catalog, <strong>content-addressed and shared</strong>: series sampled at
-the same instants — an outage schedule, a set of event times, a market timeline — hold one copy
-between them rather than one each. That shared vector is also the series' <em>cohort</em>: the values of
-every series on it are column-packed into one timestamp-major HDF5 dataset, exactly as
-<code>SingleTimeSeries</code> at one resolution are, so a <a href="../reference/rust-api.html#readers"><code>StaticReader</code></a>
-can sweep them a timestamp at a time. A series alone on its time axis keeps a standalone array
-instead — packing only pays once a cohort is several columns wide. See the
-<a href="./storage-model.html">storage model</a> for the layout.</p>
-<h3 id="singletimeseries"><a class="header" href="#singletimeseries"><code>SingleTimeSeries</code></a></h3>
-<p>A <code>SingleTimeSeries</code> is an <code>initial_timestamp</code>, a <code>resolution</code> (a <a href="#periods">period</a>), and an array
-of values:</p>
-<pre><code class="language-text">value
-  ^
-  |        *
-  |     *     *
-  |  *           *
-  +--+--+--+--+--+--&gt; time
-   t0 t0+r  ...   t0+(n-1)r
-</code></pre>
-<p>The timestamps are implied — sample <code>i</code> is at <code>initial_timestamp + i * resolution</code> — so only the
-values are stored.</p>
-<h3 id="periods"><a class="header" href="#periods">Periods</a></h3>
-<p><code>resolution</code>, and the forecast <code>horizon</code>/<code>interval</code>, are <strong>calendar-aware periods</strong>, not plain fixed
-spans. A period is one of two kinds:</p>
-<ul>
-<li><strong>fixed</strong> — a fixed nanosecond span (<code>Hour</code>, <code>Minute</code>, <code>Day</code>, <code>Week</code>), backed by a duration;</li>
-<li><strong>calendar</strong> — a count of calendar months (<code>Month</code> = 1, <code>Quarter</code> = 3, <code>Year</code> = 12), where
-<code>initial_timestamp + i * resolution</code> is computed by calendar arithmetic (so a monthly grid lands
-on the same day-of-month each step rather than every <code>N</code> milliseconds).</li>
-</ul>
-<p>A fixed period is <strong>never</strong> equal to a calendar one, even when their spans coincide for a given
-month. Periods are encoded as ISO-8601 duration strings (<code>PT1H</code>, <code>P1M</code>, <code>P1Y</code>) on disk and across
-every binding (the Python/gRPC surfaces accept a <code>timedelta</code>/duration for fixed periods and an
-ISO-8601 string for either kind, and return the ISO-8601 string).</p>
-<h3 id="typed-n-dimensional-arrays"><a class="header" href="#typed-n-dimensional-arrays">Typed, N-dimensional arrays</a></h3>
-<p>Every series' values are a <strong><code>TypedArray</code></strong>: an element <code>dtype</code> (<code>f64</code>, <code>f32</code>, the integer widths,
-or <code>bool</code>) and a shape <code>[length, k1, k2, …]</code>. The first axis is time; the trailing axes are a fixed
-<strong>per-step element shape</strong>, so a step can hold a scalar (empty element shape) or a small tuple — for
-example the 3 coefficients of a quadratic cost curve (element shape <code>[3]</code>). The association's
-<code>element_type</code> says what those elements mean and how a ragged value (a piecewise curve, say) is
-packed into a fixed-width row — see <a href="../reference/element-types.html">Element types</a>. The optional
-<code>application_data</code> payload travels alongside for a binding's own use; the store never interprets it.</p>
-<h3 id="forecasts"><a class="header" href="#forecasts">Forecasts</a></h3>
-<p>The four forecast types store their values as a content-addressed <code>TypedArray</code> in its <strong>native
-shape</strong> (the dense types as standalone HDF5 variables; a <code>DeterministicSingleTimeSeries</code> reuses its
-backing <code>SingleTimeSeries</code> array), while the windowing parameters live in metadata. A forecast
-association records <code>horizon</code> (the span each window covers), <code>interval</code> (the spacing between
-successive window start times), <code>count</code> (the number of windows), and — for <code>Probabilistic</code> — a
-<code>percentiles</code> vector.</p>
-<div class="table-wrapper"><table><thead><tr><th>Type</th><th>Conventional array shape</th><th>Extra metadata</th></tr></thead><tbody>
-<tr><td><code>Deterministic</code></td><td><code>(horizon_count, count)</code></td><td>—</td></tr>
-<tr><td><code>DeterministicSingleTimeSeries</code></td><td>the backing <code>SingleTimeSeries</code> array</td><td>—</td></tr>
-<tr><td><code>Probabilistic</code></td><td><code>(percentile_count, horizon_count, count)</code></td><td><code>percentiles</code></td></tr>
-<tr><td><code>Scenarios</code></td><td><code>(scenario_count, horizon_count, count)</code></td><td>—</td></tr>
-</tbody></table>
-</div>
-<p>The store does not interpret the layout — the caller owns the array shape (the Rust core takes a
-native-shape <code>TypedArray</code> inside a <code>Deterministic</code> / <code>Probabilistic</code> / <code>Scenarios</code> object; the C ABI
-takes a row-major byte buffer with explicit dims, and the Julia wrapper accepts a native array and
-serializes it row-major), and a <code>DeterministicSingleTimeSeries</code> deduplicates against the static
-series it forecasts. A <code>DeterministicSingleTimeSeries</code> is not added directly — it is derived from
-every stored <code>SingleTimeSeries</code> by <code>transform_single_time_series</code> (Rust core, C ABI, Python, Julia),
-sharing the underlying array. Because a <code>DeterministicSingleTimeSeries</code> is a synthetic view of a
-<code>SingleTimeSeries</code>, it is <strong>mutually exclusive</strong> with a real <code>Deterministic</code> for the same family
-(<code>owner</code>, <code>name</code>, <code>resolution</code>, <code>features</code>, regardless of interval): adding a <code>Deterministic</code> when a
-<code>DeterministicSingleTimeSeries</code> view exists — or deriving one when a <code>Deterministic</code> exists — raises
-<code>InvalidParameter</code>. Forecast values read back through the high-level path — <code>get_time_series</code>
-returns a forecast object in the Rust core, Python, and over gRPC, and Julia exposes
-<code>get_time_series(Deterministic, …)</code> / <code>get_time_series(Probabilistic, …)</code> /
-<code>get_time_series(Scenarios, …)</code> — while the low-level metadata + array path remains available for
-raw access. See the <a href="../reference/rust-api.html#forecasts">Rust API</a> and
-<a href="../reference/c-abi.html#forecasts">C ABI</a>.</p>
+therefore take the category alongside the id (see <a href="#identity">Identity</a>).</p>
 <h2 id="features"><a class="header" href="#features">Features</a></h2>
 <p>Two series can share an owner and a name yet differ — for example a load profile for model year 2030
 versus 2050. <strong>Features</strong> disambiguate them. A feature map is a set of typed key/value pairs:</p>
@@ -325,15 +215,15 @@ versus 2050. <strong>Features</strong> disambiguate them. A feature map is a set
 <p>Feature values are one of four kinds: <code>int</code>, <code>float</code>, <code>bool</code>, or <code>str</code>. Internally the map is sorted
 by key (a <code>BTreeMap</code>), which gives a stable order for hashing and for the uniqueness constraint.</p>
 <h3 id="reserved-feature-names"><a class="header" href="#reserved-feature-names">Reserved feature names</a></h3>
-<p>A feature name may not collide with a field of a time series or of the <a href="#keys">key</a> that addresses
-one. Consumers routinely spread a feature map into a keyword-argument query — for example
-<code>get_time_series(...; name = "load", model_year = 2030)</code> — and a feature called <code>name</code> or
-<code>resolution</code> would shadow the real field there and silently change what the query means. Adding a
-time series with one of these names raises <code>InvalidParameter</code>:</p>
+<p>A feature name may not collide with a field of a time series or of the <a href="#identity">identity</a> a row
+is filed under. Consumers routinely spread a feature map into a keyword-argument query — for example
+<code>list_metadata(...; name = "load", model_year = 2030)</code> — and a feature called <code>name</code> or <code>resolution</code>
+would shadow the real field there and silently change what the query means. Adding a time series
+with one of these names raises <code>InvalidParameter</code>:</p>
 <pre><code class="language-text">application_data, component_field, count, data, data_hash, dtype, element_shape, element_type, ext,
-features, horizon, initial_timestamp, interval, length, name, owner_category, owner_id, owner_type,
-percentiles, quantity_kind, resolution, scenario_count, time_series_type, timestamps, unit_system,
-units
+features, horizon, id, initial_timestamp, interval, length, name, owner_category, owner_id,
+owner_type, percentiles, quantity_kind, resolution, scenario_count, time_reference,
+time_series_type, timestamps, unit_system, units
 </code></pre>
 <p><code>dtype</code> and <code>ext</code> no longer name metadata fields — <code>element_type</code> and <code>application_data</code> replaced
 them — but both stay reserved. <code>dtype</code> is still how every binding spells a <code>TypedArray</code>'s physical
@@ -343,20 +233,19 @@ silently accepted as an ordinary feature.</p>
 rejected, while <code>Resolution</code> and <code>resolution_hours</code> are ordinary feature names. The rule applies to
 writes only, so a store written before it existed stays readable and its series can still be listed
 and removed.</p>
-<h2 id="keys"><a class="header" href="#keys">Keys</a></h2>
-<p>A <strong><code>TimeSeriesKey</code></strong> is the logical handle that re-finds a series. It is exactly the tuple that
-must be unique:</p>
-<pre><code class="language-text">TimeSeriesKey = (owner_id, owner_category, time_series_type, name, resolution, interval, features)
+<h2 id="identity"><a class="header" href="#identity">Identity</a></h2>
+<p>Every association is filed under a tuple that must be unique:</p>
+<pre><code class="language-text">identity = (owner_id, owner_category, time_series_type, name, resolution, interval, features)
 </code></pre>
-<p><code>add_time_series</code> returns a key; <code>get_time_series</code>, <code>has_time_series</code>, and <code>remove_time_series</code> take
-one. Two series with the same key cannot coexist — attempting to add a duplicate raises
-<code>DuplicateTimeSeries</code>. Change any element of the tuple (a different <code>name</code>, a different <code>model_year</code>
-feature, a different <code>resolution</code>, a different forecast <code>interval</code>, or a different <code>owner_category</code>)
-and you have a distinct series. <code>interval</code> is <code>NULL</code> for the static types (which never carry one);
-for forecasts it lets two series of one variable at the same resolution but different intervals
-(e.g. a day-ahead and a real-time forecast) coexist as distinct series. Because <code>owner_category</code> is
-part of the key, a component and a supplemental attribute that share a numeric <code>owner_id</code> keep
-entirely separate sets of series.</p>
+<p>This is what the catalog de-duplicates on — it is <strong>not</strong> how a caller addresses a series. That is
+the <a href="#association-ids">association id</a> below. Two series with the same identity cannot coexist —
+attempting to add a duplicate raises <code>DuplicateTimeSeries</code>. Change any element of the tuple (a
+different <code>name</code>, a different <code>model_year</code> feature, a different <code>resolution</code>, a different forecast
+<code>interval</code>, or a different <code>owner_category</code>) and you have a distinct series. <code>interval</code> is <code>NULL</code>
+for the static types (which never carry one); for forecasts it lets two series of one variable at
+the same resolution but different intervals (e.g. a day-ahead and a real-time forecast) coexist as
+distinct series. Because <code>owner_category</code> is part of the key, a component and a supplemental
+attribute that share a numeric <code>owner_id</code> keep entirely separate sets of series.</p>
 <pre class="mermaid">flowchart LR
     OWNER[&quot;owner_id=42, category=Component, type=Generator&quot;]
     OWNER --&gt; K1[&quot;name=load&lt;br/&gt;year=2030&quot;]
@@ -373,8 +262,164 @@ entirely separate sets of series.</p>
     style A1 fill:#28a745,color:#fff
     style A2 fill:#28a745,color:#fff
 </pre>
-<p>Note that two different keys (<code>K1</code> and <code>K3</code> above) can point at the <em>same</em> underlying array. The key
-is a metadata concept; the array is shared by <a href="./content-addressing.html">content addressing</a>.</p>
+<p>Note that two different series (<code>K1</code> and <code>K3</code> above) can point at the <em>same</em> underlying array. An
+identity is a metadata concept; the array is shared by
+<a href="./content-addressing.html">content addressing</a>.</p>
+<h2 id="association-ids"><a class="header" href="#association-ids">Association IDs</a></h2>
+<p>Every catalog row has an <strong><code>id</code></strong>: a plain integer, assigned by the store, that names <em>that row</em>. It
+is <strong>the</strong> way to address a series — every read, removal and copy takes one.</p>
+<p>The identity above describes a series: owner, name, resolution, features. An id names the row the
+store filed it under. That difference is the point: a consumer that wants to record "this
+generator's cost curve is <em>that</em> series" inside its own object model would otherwise have to embed
+the whole identity tuple, and keep it in step with every change to it. An id is one integer, and
+nothing moves it: a name is fixed once written, so the two can never drift apart.</p>
+<pre><code class="language-julia">id = add_time_series!(store, 42, "ThermalStandard", Component, cost_curve)
+generator.operation_cost.variable = id   # one integer, stored in the model
+</code></pre>
+<p>The surface splits in two along that line. <strong>Identify</strong> — <code>list_metadata</code> and its by-id companions —
+answers which series exist and hands back the id for each. <strong>Act</strong> — every read, removal and copy —
+takes that id. A caller that knows a series only by its attributes does the first half once and
+keeps the id; there is deliberately no combined resolver, because the two halves have different
+costs and a caller that repeats a lookup it could have cached should be able to see that it is.</p>
+<p>Three properties make an id safe to persist:</p>
+<ul>
+<li><strong>It is never reissued.</strong> Deleting a row strands its id permanently. A reference to a deleted
+series stops resolving — it can never come back meaning a <em>different</em> series, which is the failure
+a recycled row number would cause silently, with no foreign key anywhere to catch it.</li>
+<li><strong>It survives the operations that change a series' description.</strong> A rename or a reassignment to a
+new owner keeps the id, as do <code>compact</code> and a save-and-reopen. Those are <code>UPDATE</code>s and file
+copies, not new rows.</li>
+<li><strong>It is not part of identity.</strong> Two series differing only in id are the same series to the
+uniqueness rule and to both content hashes. It describes the <em>row</em>, not the data.</li>
+</ul>
+<p><strong>The store assigns it; no add accepts one.</strong> Not <code>add_time_series</code>, not a bulk add, and not either
+association catalog's <code>attach</code> / <code>link</code>. This is what makes "never reissued" a guarantee rather than
+a convention: <code>AUTOINCREMENT</code> only ratchets its counter upward, so an assigned id is never handed
+out twice, while a caller free to name one could re-file a retired id and make a stale reference in
+some consumer's model quietly resolve to a different series. The association row types carry an <code>id</code>
+field because a listing populates one, but it is an output — an add ignores it, so a row read from
+one store and attached to another is filed under a fresh id there.</p>
+<p>What an id does <em>not</em> do is travel between stores. It is the row's number in one catalog, so a
+<code>merge</code> assigns fresh ids in the destination, and two stores holding identical content will disagree
+about them. The one place ids do cross a boundary — and the one writer that files rows under ids it
+was given — is the <a href="../reference/file-format.html">OpenAPI document round trip</a>, where preserving them
+is the whole point: an import that assigned fresh ids would leave every reference the document
+carries pointing at the wrong series. That wire form spells the field <code>association_id</code> — in a
+document traveling beside components and supplemental attributes, an unqualified <code>id</code> would not say
+which id it is — and the schema requires it on every time-series row. Because the import is the only
+door, the guarantee holds there too: a supplied id must sit above the destination catalog's counter
+(<code>DuplicateAssociationId</code> otherwise, so a document's ids fit a fresh store but not one that has
+issued ids of its own), and a document supplies one for every row or for none. Neither association
+catalog's wire form carries an id at all, so both always assign.</p>
+<p>The same round trip carries two fields the schema gained late
+(<code>crates/infrastore-core/sienna_schemas/SOURCE.md</code> records the upstream commit vendored here):
+<code>array_shape</code>, the stored array's full native shape (<code>[length, *element_shape]</code> in the catalog's
+terms, where the schema's <code>element_shape</code> is only the per-step trailing shape), and
+<code>time_reference</code>. Both exist so an imported row is <em>identical</em> to the exported one — the forecast
+layouts above are conventions the caller owns, so the native shape cannot be rebuilt from <code>horizon</code>
+and <code>count</code>. Neither is required: a producer predating them writes rows without them, a reader that
+does not know them ignores them, and an import that finds them absent falls back to the schema's own
+fields.</p>
+<h3 id="reading-an-artifact-back-from-arrays-plus-a-document"><a class="header" href="#reading-an-artifact-back-from-arrays-plus-a-document">Reading an artifact back from arrays plus a document</a></h3>
+<p>Those two fields exist so that a document can stand in for the catalog entirely. A consumer that
+already ships the association rows in JSON of its own — PowerSystems writes a <code>system.json</code> beside a
+<code>time_series.h5</code> — carries the <code>.sqlite</code> half for nothing: the arrays are the part that cannot be
+reconstructed, and the catalog can be replayed. <code>Store::open_without_catalog</code> is the way in. It
+opens the array half of an artifact whose catalog is absent and mints an empty one carrying the
+array file's <em>own</em> generation stamp, so the rebuilt pair opens normally ever after; an ordinary
+<code>open</code> cannot, because a stamped array file beside an unstamped catalog is exactly the half-finished
+save the paired-stamp check exists to catch.</p>
+<p>All six of the types the wire contract defines make the trip, including <code>NonSequentialTimeSeries</code> —
+which needs one field the others do not. (A <code>PersistentTimeSeries</code> does not: it is an
+infrastore-local extension outside the vendored <code>oneOf</code>, so the export omits its rows and the import
+refuses them. A store holding them still exports the rest, but a restore from arrays plus a document
+alone will not carry them.) Its timestamp vector lives in the store rather than the document,
+content-addressed so a cohort sharing one axis stores it once, and the values cannot imply which
+axis a row is on: arrays are content-addressed too, so two irregular series with byte-identical
+values on <em>different</em> axes share one stored array and only the catalog's <code>timestamps_hash</code>
+distinguishes them. An import that guessed would hand back another series' timestamps. So the wire
+form <strong>locates</strong> the axis, as <code>timestamps_uri</code> — the same kind of field <code>uri</code> is for the values, and
+a locator rather than the vector itself precisely because the axis is shared, where inlining it
+would repeat the whole vector on every row of the cohort. The axis ships in the array file alongside
+the arrays, so the import resolves the locator against the store; a row missing it, or naming an
+axis the store does not hold, is refused.</p>
+<p>Both imports validate every incoming row against those vendored schemas before decoding it, so a
+document that drifted from the contract is refused in the schema's own terms — the row, the field,
+and what was expected — rather than by whatever the Rust struct happens to notice first. A
+time-series row is checked against the per-type schema its own <code>time_series_type</code> selects, which is
+what the wrapper's <code>discriminator</code> prescribes and what keeps the error specific: a failed <code>oneOf</code>
+can only report that nothing matched.</p>
+<p>Each of the three catalog tables keeps its own independent counter, so an id is only meaningful
+alongside the table it came from.</p>
+<p>Writes report the id they used, and reads take one:</p>
+<div class="table-wrapper"><table><thead><tr><th>Direction</th><th>Rust</th><th>Python</th><th>Julia</th></tr></thead><tbody>
+<tr><td>Write</td><td><code>add_time_series</code> → <code>TimeSeriesId</code></td><td>→ <code>int</code></td><td>→ <code>Int64</code></td></tr>
+<tr><td>Identify</td><td><code>list_metadata</code></td><td><code>list_metadata</code></td><td><code>list_metadata</code></td></tr>
+<tr><td>…by id</td><td><code>list_metadata_by_ids</code></td><td><code>list_metadata_by_ids</code></td><td><code>list_metadata_by_ids</code></td></tr>
+<tr><td>Resolve</td><td><code>get_metadata_by_id</code></td><td><code>get_metadata_by_id</code></td><td><code>get_metadata_by_id</code></td></tr>
+<tr><td>Validate</td><td><code>association_exists</code></td><td><code>association_exists</code></td><td><code>association_exists</code></td></tr>
+<tr><td>Read</td><td><code>read_by_ids</code></td><td><code>read_by_ids</code></td><td><code>read_by_ids</code></td></tr>
+<tr><td>Read one</td><td><code>read_by_id</code></td><td><code>read_by_id</code></td><td><code>read_by_id</code></td></tr>
+<tr><td>Read range</td><td><code>read_by_ids_range</code></td><td><code>read_by_ids_range</code></td><td><code>read_by_ids</code></td></tr>
+<tr><td>Remove</td><td><code>remove_by_ids</code></td><td><code>remove_by_ids</code></td><td><code>remove_by_ids!</code></td></tr>
+</tbody></table>
+</div>
+<p>In the Rust core an id is the newtype <code>TimeSeriesId</code>, so an <code>owner_id</code> cannot be passed where a
+series id belongs; the dynamic bindings exchange a plain integer.</p>
+<p><code>association_exists</code> fetches no row, so a consumer can check every reference in its model on load
+rather than discovering a dangling one mid-simulation.</p>
+<p><code>read_by_ids</code> and <code>remove_by_ids</code> both refuse a set containing an id that names no row — the read
+returns nothing, the removal removes nothing. That is deliberate: a caller working from references
+it recorded earlier has a model that disagrees with the store, and since an id is never reissued the
+disagreement will not resolve itself. Sift the set with <code>association_exists</code> first when some
+references are expected to have gone.</p>
+<p><code>read_by_id</code> is the single-id read, and it also takes the slice: a <code>start_time</code> plus a <code>len</code> of
+timesteps or a <code>count</code> of windows. Both halves happen in one call because the primary-key lookup
+already returns the row the window resolves against — a consumer holding an id spends nothing to
+learn a series' <code>resolution</code> or <code>count</code> before asking for the second day of it. A window is
+<em>checked</em>, where <code>read_by_ids_range</code> <em>clips</em>: a start off the series' own grid, or an extent running
+past its end, is an error rather than the smaller answer a range would return. A range says
+"whatever lies between these bounds" — which is what an export wants, knowing the bounds and not the
+step count — while a window says "these exact steps", and a caller that asked for 24 and silently
+received 3 has a bug the store can see and it cannot. What a range clips <em>to</em> is type-specific: a
+regular series' value covers its step, so a <code>start</code> inside a step selects that step and the sliced
+<code>initial_timestamp</code> can precede <code>start</code>; an irregular series' value is an instant, so only
+timestamps at or after <code>start</code> are selected; and a forecast window is a whole array with nothing
+partial to return, so a forecast's <code>start</code> must be a window boundary at or before the last window
+(an error otherwise) and only its <code>end</code> clips. A <code>start</code> earlier than the <em>first</em> window is the one
+exception, and it clips: there is no partial window before the first one, only no window at all, and
+refusing it would fail every export window wider than the data. See
+<a href="../reference/rust-api.html#reading-a-time-range">Reading a time range</a>.</p>
+<h3 id="a-calendar-period-is-not-closed-under-slicing"><a class="header" href="#a-calendar-period-is-not-closed-under-slicing">A calendar period is not closed under slicing</a></h3>
+<p>A <code>SingleTimeSeries</code> and a dense forecast are each stored as an anchor, a period, and a count, so a
+sliced read has to describe its answer the same way — anchored at the slice's own first point. For a
+fixed period that is exact. For a <code>Period::Months</code> it is not, because the end-of-month clamp is not
+associative: a grid stepping monthly from Jan-31 is Jan-31, Feb-29, Mar-31, but re-anchored at its
+own Feb-29 it becomes Feb-29, Mar-29, Apr-29 — the stored values under dates the store does not
+hold. No anchor fixes it, because the sub-grid keeps the <em>original</em> anchor's day of month and no
+instant in the slice carries it.</p>
+<p>So such a slice is <strong>refused</strong> (<code>InvalidParameter</code>) rather than answered with a grid that is not the
+one stored — the values would be right, the dates wrong, and nothing would signal it. The refusal is
+narrow: it needs a calendar period, an anchor on a day some month is too short for, and a slice
+starting at a clamped point and running past it. Read the series whole and slice the materialized
+timestamps, or store the instants explicitly with <code>NonSequentialTimeSeries</code>.
+<code>transform_single_time_series</code> is held to the same rule at <em>write</em> time, since each window of the
+view it derives is a run of the source's own steps described that same way.</p>
+<h3 id="the-owner-guard"><a class="header" href="#the-owner-guard">The owner guard</a></h3>
+<p><code>read_by_id</code> and <code>remove_by_ids</code> each take an optional <strong>expected owner</strong> — <code>read_by_id_for_owner</code> /
+<code>remove_by_ids_for_owner</code> in the Rust core, an <code>owner=(id, category)</code> keyword in Julia, keyword-only
+<code>owner_id</code> / <code>owner_category</code> in Python, <code>has_owner</code> beside the two across the C ABI. The row is
+held to that owner, and one belonging to anyone else is <code>OwnerMismatch</code> rather than a read or a
+delete.</p>
+<p>It exists because the two halves cannot be checked separately. An id is the whole address and it
+survives <code>replace_owner</code>, so a consumer whose model says "this component's series" — and which
+therefore wants to confirm the owner before acting — has a window between the confirming call and
+the acting one. A reassignment landing in that window makes the removal retire the <em>new</em> owner's
+series, which is exactly what checking the owner was meant to prevent. Passing the owner into the
+call closes the window: the check and the act are one transaction. On the read side there is no
+window either way, but the guard is still the cheaper spelling — the owner comes off the same row
+the values are materialized from, so it costs nothing, where a separate check is a second round
+trip.</p>
 <h2 id="optional-descriptors"><a class="header" href="#optional-descriptors">Optional Descriptors</a></h2>
 <p>Each association can also carry:</p>
 <ul>
@@ -406,10 +451,16 @@ convention in many models but are not the same thing, since one component may ca
 for one field (a forecast and an actual, a set of weather years) and <code>name</code> is part of a series'
 identity where this is not. Named for the common case; when the owner is a supplemental attribute
 it names a field on that attribute.</li>
+<li><strong><code>time_reference</code></strong> — how this series' timestamps were <em>spelled</em>: <code>utc</code>, <code>zoneless</code>, a fixed
+offset (<code>-07:00</code>), or an IANA zone name (<code>America/Denver</code>). See
+<a href="./time-references.html">Time References</a>, which this one deserves a page of its own for.</li>
 <li><strong><code>application_data</code></strong> — an opaque, <strong>package-owned</strong> extension payload stored verbatim (typically
 JSON) that a binding writes and reads for its own purposes. The store never parses or interprets
 it, and end users are not expected to set it. Element typing does <em>not</em> live here: that is
-<code>element_type</code> below, a first-class column the store owns and validates.</li>
+<code>element_type</code> below, a first-class column the store owns and validates. This is also where
+application <em>policy</em> about a series belongs — a consumer's rule for collapsing a
+<a href="./time-series-types.html#persistenttimeseries"><code>PersistentTimeSeries</code></a> to a scalar, say. Such a
+rule is not storage, and it gets no catalog column.</li>
 <li><strong><code>element_type</code></strong> — what the array's elements <em>mean</em>, in the store's own language-neutral
 vocabulary: a dtype spelling (<code>f64</code>, <code>i64</code>, …) for plain numbers, else <code>tuple(N,dtype)</code> or one of
 the function-data kinds (<code>linear_function</code>, <code>quadratic_function</code>, <code>piecewise_linear</code>,
@@ -418,9 +469,10 @@ derived from it. Unlike <code>units</code> and <code>application_data</code> it 
 validates the array's dtype and per-step shape against it. See
 <a href="../reference/element-types.html">Element types</a>.</li>
 </ul>
-<p><code>units</code>, <code>quantity_kind</code>, <code>unit_system</code>, <code>component_field</code>, and <code>application_data</code> are recorded in
-metadata and returned on read, but they do not affect identity or storage: they are absent from the
-key and from both content hashes, so two series differing only in a descriptor are a duplicate.</p>
+<p><code>units</code>, <code>quantity_kind</code>, <code>unit_system</code>, <code>time_reference</code>, <code>component_field</code>, and <code>application_data</code>
+are recorded in metadata and returned on read, but they do not affect identity or storage: they are
+absent from the key and from both content hashes, so two series differing only in a descriptor are a
+duplicate.</p>
 <p><code>component_field</code> is the one descriptor that is also a <strong>filter</strong> (<code>ListFilter::component_field</code>,
 and its equivalent in every binding): "every series that varies this field", alone or scoped to one
 owner. Being descriptive rather than identifying, it narrows a listing but never addresses a single
@@ -468,20 +520,61 @@ type into its subtypes stays in the calling language, where the type hierarchy l
 described above — are also called "associations" throughout this documentation and the code. They
 are unrelated to the entity-to-entity tables described in this section.</p>
 </blockquote>
-<p>Both are available in the Rust core, the C ABI, Julia, and Python; neither is exposed over gRPC or
-the <code>infrastore</code> CLI. The supplemental-attribute surface is the wider of the two (it carries counts
-and a grouped summary) because each of its operations is driven by an existing consumer; the
-parent/child surface is deliberately narrower for now.</p>
+<p>Both are available in the Rust core, the C ABI, Julia, Python, and the <code>infrastore</code> CLI (<code>attach</code> /
+<code>detach</code> / <code>link</code> / <code>unlink</code>); neither is exposed over the read-only gRPC server. The
+supplemental-attribute surface is the wider of the two (it carries counts and a grouped summary)
+because each of its operations is driven by an existing consumer; the parent/child surface is
+deliberately narrower for now.</p>
+<h2 id="store-attributes"><a class="header" href="#store-attributes">Store attributes</a></h2>
+<p>Everything above describes a <em>row</em>: a series' <code>application_data</code>, a component's supplemental
+attributes, an edge between two components. <strong>Store attributes</strong> describe the artifact itself.</p>
+<p>A store attribute is a key/value pair recorded once per store — who built it, from what source
+system, under which of the consumer's own schema versions. The store never interprets a value, in
+exactly the same spirit as <code>application_data</code>: keys and values are TEXT, nothing here participates
+in any identity, hash, or query, and a caller wanting structure stores JSON.</p>
+<pre><code class="language-rust ignore">store.set_store_attribute("creator", "sienna-build")?;
+store.set_store_attribute("source_system", "WECC 2032 ADS")?;
+assert_eq!(store.get_store_attribute("creator")?.as_deref(), Some("sienna-build"));</code></pre>
+<p>Note the term and the prefix. In this project a bare "attribute" means a <em>supplemental</em> attribute
+(above) and a bare "metadata" means a <code>TimeSeriesMetadata</code> row, so every identifier for this feature
+carries <code>store_</code>: <code>set_store_attribute</code>, <code>list_store_attributes</code>, the CLI's <code>store-attr</code>, the
+<code>store_attributes</code> table. Neither misreading is available.</p>
+<p>Four rules are worth stating outright:</p>
+<ul>
+<li><strong>A set replaces.</strong> <code>key</code> is the primary key, so an artifact records one creator rather than a
+history of them.</li>
+<li><strong>An absent key is <code>None</code>, not an error.</strong> A consumer asking whether the artifact carries a key is
+asking a question, the same reading <a href="#association-ids"><code>get_metadata_by_id</code></a> takes. A key set to
+the empty string is <em>present</em>; every binding keeps the two distinguishable.</li>
+<li><strong><code>infrastore.</code> is reserved</strong>, refused on removal as well as on write, so the store can stamp
+facts of its own later without colliding with a consumer's keys — and so a reserved key cannot be
+worked around by deleting it.</li>
+<li><strong>Attributes are content.</strong> <code>is_empty</code> reports <code>false</code> for a store holding nothing but provenance:
+those rows are the consumer's own text, recoverable from nowhere else, and a consumer that skips
+writing an "empty" store would drop them with no error.</li>
+</ul>
+<p>They live in the catalog, so they travel with <code>persist_to</code> and <code>persist_catalog</code>, survive <code>compact</code>
+(which rewrites only the array half), and come across with <code>open_copy</code>. <code>open_without_catalog</code> mints
+an empty set, since there is nowhere else for them to have been. They are <strong>not</strong> carried by the
+OpenAPI export or import: the vendored schema has no place for them.</p>
+<p>Available in the Rust core, the C ABI, Julia, Python, and the CLI (<code>store-attr</code>, plus
+<code>store_attributes</code> in <code>store-info</code>); the read-only gRPC server carries the read half
+(<code>ListStoreAttributes</code>, <code>GetStoreAttribute</code>).</p>
+<p>The CLI's two cross-store commands take a position rather than ignoring the table. <code>merge</code> is
+additive with the <strong>destination winning</strong>: a merge brings data into an artifact that already has an
+identity, so a key the destination lacks is copied, a key both sides agree on is a no-op, and a
+disagreement is reported and left as the destination has it. <code>diff</code> gives them a section of their
+own — there is no series identity to pair them on — and counts a difference toward its nonzero exit.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../explanation/design-choices.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../explanation/time-series-types.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <i class="fa fa-angle-left"></i>
                             </a>
 
-                            <a rel="next prefetch" href="../explanation/storage-model.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../explanation/time-references.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <i class="fa fa-angle-right"></i>
                             </a>
 
@@ -491,11 +584,11 @@ parent/child surface is deliberately narrower for now.</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../explanation/design-choices.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../explanation/time-series-types.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <i class="fa fa-angle-left"></i>
                     </a>
 
-                    <a rel="next prefetch" href="../explanation/storage-model.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../explanation/time-references.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <i class="fa fa-angle-right"></i>
                     </a>
             </nav>

@@ -204,16 +204,16 @@ the API speaks.</p>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
 </span>use std::path::Path;
-use infrastore_core::{create_store, open_store};
+use infrastore_core::Store;
 
 // In-memory (tests, scratch work): no filesystem I/O.
-let mut store = create_store(None, true)?;
+let mut store = Store::create(None, true)?;
 
 // On disk: writes system.h5 and system.h5.sqlite.
-let mut store = create_store(Some(Path::new("system.h5")), false)?;
+let mut store = Store::create(Some(Path::new("system.h5")), false)?;
 
 // Reopen later, read-only.
-let store = open_store(Path::new("system.h5"), /* read_only */ true)?;
+let store = Store::open(Path::new("system.h5"), /* read_only */ true)?;
 <span class="boring">}</span></code></pre></pre>
 <h2 id="add-a-series"><a class="header" href="#add-a-series">Add a Series</a></h2>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
@@ -238,12 +238,36 @@ let key = store.add_time_series(
     OwnerCategory::Component,
     TimeSeriesData::SingleTimeSeries(ts),
     features,
-    Some("MW".into()),                      // units
 )?;
 <span class="boring">}</span></code></pre></pre>
-<p><code>add_time_series</code> returns a <a href="../reference/rust-api.html#timeserieskey"><code>TimeSeriesKey</code></a> — keep it to
-re-find the series, or rebuild it from its fields later. Adding a series whose key already exists
-returns <code>TimeSeriesError::DuplicateTimeSeries</code>.</p>
+<p><code>add_time_series</code> returns a <a href="../reference/rust-api.html#timeseriesid-and-keyidentity"><code>TimeSeriesId</code></a>:
+the catalog row's id, which is both how every read and removal addresses the series and the one
+integer to store in your own object model when it needs to point at it (see
+<a href="../explanation/data-model.html#association-ids">Association ids</a>). Adding a series whose identity
+already exists returns <code>TimeSeriesError::DuplicateTimeSeries</code>.</p>
+<h3 id="descriptors"><a class="header" href="#descriptors">Descriptors</a></h3>
+<p>The descriptive attributes ride on the series object, not on the write call, so a read returns what
+the write declared:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use infrastore_core::{TimeReference, UnitSystem};
+
+let ts = SingleTimeSeries::new(initial, Duration::hours(1), data, "load")
+    .with_units("MW")
+    .with_quantity_kind("ActivePower")
+    .with_unit_system(UnitSystem::NaturalUnits)
+    .with_component_field("max_active_power")
+    .with_time_reference(TimeReference::Zone("America/Denver".into()))
+    .with_application_data(r#"{"source": "weather_year_2012"}"#);
+<span class="boring">}</span></code></pre></pre>
+<p><strong>A native Rust caller declares <code>time_reference</code> itself.</strong> Every other binding infers it from the
+input type — Python from <code>tzinfo</code>, Julia from <code>DateTime</code> versus <code>ZonedDateTime</code> — but
+<code>DateTime&lt;Utc&gt;</code> is already an instant, so there is nothing to infer from. Leaving it unset means
+<em>unspecified</em>, which is not a claim the timestamps were written as UTC. It is not inert: a query
+bound must be spelled the way the series is, and a selection spanning both coherence groups is
+refused. See <a href="../explanation/time-references.html">Time References</a>.</p>
+<p>None of these descriptors is part of a series' identity or of either content hash, so two adds
+differing only in one are a duplicate.</p>
 <h3 id="bulk-inserts"><a class="header" href="#bulk-inserts">Bulk inserts</a></h3>
 <p>For many series at once, <code>add_time_series_bulk</code> takes a <code>Vec&lt;AddRequest&gt;</code> and commits the whole
 batch atomically — any error rolls back every array and association in the call:</p>
@@ -251,7 +275,7 @@ batch atomically — any error rolls back every array and association in the cal
 </span><span class="boring">fn main() {
 </span>use infrastore_core::AddRequest;
 
-let keys = store.add_time_series_bulk(vec![
+let added = store.add_time_series_bulk(vec![
     AddRequest {
         owner_id: 42,
         owner_type: "Generator".into(),
@@ -260,9 +284,12 @@ let keys = store.add_time_series_bulk(vec![
         features: Features::new(),
         units: Some("MW".into()),
         application_data: None,                             // opaque package-owned payload (e.g. JSON)
+        ..AddRequest::new(42, "Generator", OwnerCategory::Component,
+                          TimeSeriesData::SingleTimeSeries(ts_b))   // the remaining descriptors unset
     },
-    // ...
+    // ...or just AddRequest::new(...).with_features(...)
 ])?;
+// `added` is one TimeSeriesId per request, in push order.
 <span class="boring">}</span></code></pre></pre>
 <p>A bulk insert is also the <strong>fast write path</strong>: packed <code>SingleTimeSeries</code> are grouped by shape and
 written into batch-sized datasets so the timestamp-major HDF5 chunks are filled whole, rather than a
@@ -286,42 +313,131 @@ I/O until <code>commit</code>, which is all-or-nothing. Dropping the session wit
 <p>Adding series one at a time with <code>add_time_series</code> instead packs them incrementally into shared
 default-width datasets; that stays space-efficient but writes each column with a read-modify-write,
 so prefer a bulk insert or session when loading in volume.</p>
-<h2 id="read-a-series"><a class="header" href="#read-a-series">Read a Series</a></h2>
-<p>Every lookup method (<code>get_time_series</code>, <code>get_metadata</code>, <code>has_time_series</code>, <code>remove_time_series</code>,
-<code>bulk_read</code>) takes a <code>&amp;KeyIdentity</code> — the identifying tuple inside a key. Call
-<code>TimeSeriesKey::identity()</code> to get it:</p>
+<h3 id="the-irregular-types"><a class="header" href="#the-irregular-types">The irregular types</a></h3>
+<p><code>NonSequentialTimeSeries</code> carries an explicit instant per value instead of a grid. Its constructor
+validates that the timestamps are strictly increasing and match the data length, and returns
+<code>Result&lt;Self, String&gt;</code>:</p>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>let data = store.get_time_series(key.identity(), None)?;
-let single = data.as_single().expect("this key names a SingleTimeSeries");
+</span>use infrastore_core::NonSequentialTimeSeries;
+
+// Values that exist only at these instants — asking between them is an error.
+let outages = NonSequentialTimeSeries::new(instants, data, "forced_outage")?;
+
+store.add_time_series(
+    42, "ThermalStandard", OwnerCategory::Component,
+    TimeSeriesData::NonSequentialTimeSeries(outages), Features::new(),
+)?;
+<span class="boring">}</span></code></pre></pre>
+<p><code>PersistentTimeSeries</code> takes the same arguments and stores the same way — the vector is a set of
+<em>breakpoints</em> — but reads as a <strong>step function</strong>: the value at an instant is the one belonging to
+the greatest breakpoint at or before it, held forward past the last. Reaching back before the first
+breakpoint is an error, not a clamp.</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use infrastore_core::PersistentTimeSeries;
+
+// A monthly fuel price: twelve breakpoints, read at any simulation instant.
+let prices = PersistentTimeSeries::new(month_starts, data, "fuel_price")?;
+
+store.add_time_series(
+    42, "ThermalStandard", OwnerCategory::Component,
+    TimeSeriesData::PersistentTimeSeries(prices), Features::new(),
+)?;
+<span class="boring">}</span></code></pre></pre>
+<p><code>PersistentTimeSeries::value_at</code> reads one instant — <code>prices.value_at::&lt;f64&gt;(t)?</code> — carrying the
+last breakpoint's value forward to it, with <code>row_at</code> as the shape-generic form and <code>index_at</code> /
+<code>breakpoint_at</code> for the row it came from. A time-range read begins at the breakpoint in force at
+<code>start</code>, so the slice always defines a value there. A columnar sweep is
+<a href="../explanation/readers.html"><code>StaticReader</code></a>, which for this type alone lets its columns sit on
+independent breakpoint vectors.</p>
+<h3 id="values-that-are-not-numbers"><a class="header" href="#values-that-are-not-numbers">Values that are not numbers</a></h3>
+<p>A timestep's value can be a function rather than a number — a cost curve re-offered every hour, a
+pair of coefficients, a fixed-width tuple. The array still holds <code>f64</code>; what those elements <em>mean</em>
+is the series' <a href="../reference/element-types.html"><code>element_type</code></a>, and the values themselves are a
+<a href="../reference/rust-api.html#element-values"><code>DecodedValues</code></a>.</p>
+<p>Build such a series with <code>from_values</code> rather than <code>new</code>. It encodes the values into the array <em>and</em>
+declares the element type they imply:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use infrastore_core::{DecodedValues, ElementType, XyPoint};
+
+// One input-output cost curve per hour; point counts may differ per timestep.
+let curves = DecodedValues::PiecewiseLinear(vec![
+    vec![XyPoint { x: 30.0, y: 1155.0 }, XyPoint { x: 100.0, y: 4120.0 }],
+    vec![XyPoint { x: 30.0, y: 1353.0 }, XyPoint { x: 65.0, y: 2730.0 }, XyPoint { x: 100.0, y: 4223.0 }],
+]);
+
+let ts = SingleTimeSeries::from_values(initial, Duration::hours(1), &amp;curves, "variable_cost")?;
+assert_eq!(ts.element_type, ElementType::PiecewiseLinear);   // derived, not declared
+<span class="boring">}</span></code></pre></pre>
+<p>That pairing is the point. An <code>element_type</code> and the array it describes are two independent things a
+caller can get out of step — <code>add_time_series</code> rejects the mismatch, but only after the fact.
+Deriving both from one input leaves nothing to get out of step, which is why <code>from_values</code> is
+preferred over <code>new</code> + <code>with_element_type</code> for every composite series.</p>
+<p>The read side is <code>decoded_values</code>, which takes the element type and the leading-axis count off the
+value rather than asking for them:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let data = store.read_by_id(ts_id, ReadWindow::full())?;
+assert_eq!(data.decoded_values()?, curves);
+<span class="boring">}</span></code></pre></pre>
+<p>A plain numeric series decodes to <code>DecodedValues::Raw</code> — the stored elements already are the values,
+so the array is the answer. That is a result, not an error.</p>
+<p>Every series type has <code>from_values</code>. On a forecast it carries more weight, because the leading axes
+are derived too: <code>Deterministic::from_values</code> fills <code>[H, count]</code> with <code>H</code> computed from
+<code>horizon</code>/<code>resolution</code>, so the values are one flat list in row-major order over those axes and
+nothing is reshaped by hand.</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// H = 2 (a two-hour horizon at hourly resolution) x count = 2 windows = 4 curves.
+let forecast = Deterministic::from_values(
+    initial, Duration::hours(1), Duration::hours(2), Duration::hours(1), 2, &amp;curves4, "offer",
+)?;
+<span class="boring">}</span></code></pre></pre>
+<p><code>Probabilistic::from_values</code> and <code>Scenarios::from_values</code> are the same with a third leading axis,
+taken from <code>percentiles.len()</code> and <code>scenario_count</code>.</p>
+<p>See <a href="../explanation/time-series-types.html#choosing-a-type">Choosing a Type</a> if you are deciding
+between these and a <code>SingleTimeSeries</code>.</p>
+<h2 id="read-a-series"><a class="header" href="#read-a-series">Read a Series</a></h2>
+<p>Every read takes a <code>TimeSeriesId</code> — the one an add returned, or one off a <code>list_metadata</code> row. The
+row's own type decides what comes back:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use infrastore_core::ReadWindow;
+
+let data = store.read_by_id(id, ReadWindow::full())?;
+let single = data.as_single().expect("this row holds a SingleTimeSeries");
 println!("{} values starting {}", single.length, single.initial_timestamp);
 <span class="boring">}</span></code></pre></pre>
-<p>Slice on the time axis by passing a range; <code>end</code> is exclusive and the returned series'
-<code>initial_timestamp</code>/<code>length</code> reflect the slice:</p>
+<p>Slice on the time axis with a range; <code>end</code> is exclusive, it <strong>clips</strong> to what is there, and the
+returned series' <code>initial_timestamp</code>/<code>length</code> reflect the slice:</p>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
 </span>let start = Utc.with_ymd_and_hms(2024, 1, 1, 6, 0, 0).unwrap();
 let end   = Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0).unwrap();
-let window = store.get_time_series(key.identity(), Some((start, end)))?;
+let window = store.read_by_ids_range(&amp;[id], TimeRange::new(start, end))?.remove(0);
 <span class="boring">}</span></code></pre></pre>
+<p>A <code>ReadWindow</code> is the other half of that pair: it names exact steps (<code>start</code> plus a <code>len</code> of
+timesteps or a <code>count</code> of windows) and is <strong>checked</strong>, so an over-long request is an error rather
+than the smaller answer a range would clip to.</p>
 <p>To read <strong>many whole series at once</strong> — say, loading everything for an interactive plot —
-<code>bulk_read</code> takes a slice of keys and returns a <code>TimeSeriesData</code> per key in order. It reads packed
+<code>read_by_ids</code> takes a slice of ids and returns a <code>TimeSeriesData</code> per id in order. It reads packed
 <code>SingleTimeSeries</code> in one decompress-once pass per dataset, which is much cheaper than a
-<code>get_time_series</code> per key (a single full-series read otherwise touches every chunk under the
-timestamp-major layout):</p>
+<code>read_by_id</code> each (a single full-series read otherwise touches every chunk under the timestamp-major
+layout):</p>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>let ids: Vec&lt;_&gt; = keys.iter().map(|k| k.identity()).collect();
-let series = store.bulk_read(&amp;ids)?;
+</span>let series = store.read_by_ids(&amp;ids, ReadWindow::full())?;
 <span class="boring">}</span></code></pre></pre>
 <h2 id="query-metadata"><a class="header" href="#query-metadata">Query Metadata</a></h2>
-<p><code>list_time_series</code> takes a <a href="../reference/rust-api.html#listfilter"><code>ListFilter</code></a> builder; every clause
-is ANDed, and the <code>features</code> clause is a subset match:</p>
+<p><code>list_metadata</code> takes a <a href="../reference/rust-api.html#listfilter"><code>ListFilter</code></a> builder; every clause is
+ANDed, and the <code>features</code> clause is a subset match:</p>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
 </span>use infrastore_core::{ListFilter, OwnerCategory, TimeSeriesType};
 
-let metas = store.list_time_series(
+let metas = store.list_metadata(
     ListFilter::new()
         .owner_id(42)
         .owner_category(OwnerCategory::Component)
@@ -332,20 +448,23 @@ for m in &amp;metas {
     println!("{} {:?} units={:?}", m.name, m.resolution, m.units);
 }
 
-// All keys for one owner, an existence check, distinct resolutions, counts.
+// Every row for one owner, an existence check, distinct resolutions, counts.
 // The owner is the (owner_id, owner_category) pair.
-let keys = store.get_time_series_keys(42, OwnerCategory::Component)?;
-let present = store.has_time_series(key.identity())?;
+let rows = store.list_metadata(
+    ListFilter::new().owner_id(42).owner_category(OwnerCategory::Component),
+)?;
+let ids: Vec&lt;_&gt; = rows.iter().filter_map(|m| m.id).collect();
+let present = store.association_exists(ids[0])?;
 let resolutions = store.get_resolutions(Some(TimeSeriesType::SingleTimeSeries))?;
 let counts = store.get_time_series_counts()?;
 <span class="boring">}</span></code></pre></pre>
-<p><code>list_keys(filter)</code> is the key-centric counterpart of <code>list_time_series</code>, and
-<code>list_keys_with_hash(filter)</code> pairs each key with the 32-byte content hash of the array it resolves
-to, so you can group series that share stored data:</p>
+<p>Each row carries the 32-byte content hash of the array it resolves to, so grouping a listing by
+<code>data_hash</code> finds the series that share stored data — one query, where this used to be a second
+key-shaped listing:</p>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>for (key, hash) in store.list_keys_with_hash(ListFilter::new().owner_id(42))? {
-    println!("{} -&gt; {}", key.identity().name, infrastore_core::hash::hash_hex(&amp;hash));
+</span>for m in store.list_metadata(ListFilter::new().owner_id(42))? {
+    println!("{} -&gt; {}", m.name, infrastore_core::hash_hex(&amp;m.data_hash));
 }
 <span class="boring">}</span></code></pre></pre>
 <h3 id="the-low-level-read-path"><a class="header" href="#the-low-level-read-path">The low-level read path</a></h3>
@@ -353,14 +472,15 @@ to, so you can group series that share stored data:</p>
 another store that holds its own keys — resolve metadata and fetch the array by hash:</p>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>let meta = store.get_metadata(key.identity())?;
+</span>let meta = store.get_metadata_by_id(id)?.expect("the id still resolves");
 let array = store.get_array_by_hash(&amp;meta.data_hash)?;
 <span class="boring">}</span></code></pre></pre>
 <h2 id="forecasts"><a class="header" href="#forecasts">Forecasts</a></h2>
 <p>Dense forecasts are written through the generic <code>add_time_series</code> by wrapping a <code>Deterministic</code>,
 <code>Probabilistic</code>, or <code>Scenarios</code> object in <code>TimeSeriesData</code>. Each forecast object holds a
-<code>TypedArray</code> in its native shape (the <a href="../explanation/data-model.html#forecasts">data model</a> lists the
-conventional shapes per type); the store content-addresses it and records the windowing parameters:</p>
+<code>TypedArray</code> in its native shape (the <a href="../explanation/time-series-types.html#forecasts">data model</a>
+lists the conventional shapes per type); the store content-addresses it and records the windowing
+parameters:</p>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
 </span>use infrastore_core::{Deterministic, TimeSeriesData, TimeSeriesError, TypedArray};
@@ -405,47 +525,123 @@ and <code>resolution</code> arguments are optional filters that restrict which s
     Some(Duration::hours(1).into()),     // resolution filter (Option&lt;Period&gt;; None = every one)
 )?;
 <span class="boring">}</span></code></pre></pre>
-<p><code>get_time_series</code> reconstructs forecasts too, returning a <code>TimeSeriesData::Deterministic</code>,
+<p><code>read_by_id</code> reconstructs forecasts too, returning a <code>TimeSeriesData::Deterministic</code>,
 <code>Probabilistic</code>, or <code>Scenarios</code> variant (a <code>DeterministicSingleTimeSeries</code> is synthesized into a
 <code>Deterministic</code>). Match on the variant or use the <code>as_deterministic</code> / <code>as_probabilistic</code> /
 <code>as_scenarios</code> accessors:</p>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>if let Some(d) = store.get_time_series(key.identity(), None)?.as_deterministic() {
+</span>if let Some(d) = store.read_by_id(id, ReadWindow::full())?.as_deterministic() {
     // d.data is the TypedArray; d.horizon, d.interval, d.count carry the forecast parameters
 }
 <span class="boring">}</span></code></pre></pre>
-<p>The low-level path is still available when you only need the raw array: <code>get_metadata</code> exposes
+<p>The low-level path is still available when you only need the raw array: <code>get_metadata_by_id</code> exposes
 <code>horizon</code>, <code>interval</code>, <code>count</code>, and <code>percentiles</code>, and <code>get_array_by_hash</code> returns the <code>TypedArray</code>
 in its stored shape (<code>to_f64_vec</code> returns a <code>Result&lt;_, String&gt;</code>, so map the error if your function
 returns <code>TimeSeriesError</code>):</p>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>let meta = store.get_metadata(key.identity())?;
+</span>let meta = store.get_metadata_by_id(id)?.expect("the id still resolves");
 let arr = store.get_array_by_hash(&amp;meta.data_hash)?;   // arr.shape == [horizon_count, count]
 let values = arr.to_f64_vec().map_err(TimeSeriesError::InvalidParameter)?;
 <span class="boring">}</span></code></pre></pre>
-<p>When a forecast is addressed by its attributes rather than by a key you already hold, use
-<code>resolve_forecast_key</code>: it resolves
-<code>(owner_id, owner_category, name, resolution, interval, features)</code> plus a requested <code>TimeSeriesType</code>
-to the single matching key, erroring with <code>NotFound</code> if nothing matches and <code>InvalidParameter</code> if
-the request is ambiguous. Requesting <code>TimeSeriesType::Deterministic</code> matches a stored
-<code>Deterministic</code> <em>or</em> a <code>DeterministicSingleTimeSeries</code>, so callers need not know which one is
-stored; the returned key's <code>time_series_type</code> reports the form that matched:</p>
+<p>When a forecast is known by its attributes rather than by an id you already hold, <code>list_metadata</code> is
+the identify half. Its type filter reads a <strong>request</strong>: <code>TimeSeriesType::Deterministic</code> matches a
+stored <code>Deterministic</code> <em>or</em> a <code>DeterministicSingleTimeSeries</code>, so a caller need not know which form
+the store holds, and each row still reports the concrete <code>time_series_type</code> that matched. Its <code>id</code>
+is what every read and removal takes:</p>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
 </span>use infrastore_core::TimeSeriesType;
 
-let key = store.resolve_forecast_key(
-    42,
-    OwnerCategory::Component,
-    "load_forecast",
-    None,                                  // resolution: Option&lt;Period&gt; (None = any)
-    None,                                  // interval: Option&lt;Period&gt; (None = any)
-    Features::new(),
-    TimeSeriesType::Deterministic,
+let rows = store.list_metadata(
+    ListFilter::new()
+        .owner_id(42)
+        .owner_category(OwnerCategory::Component)
+        .name("load_forecast")
+        .time_series_type(TimeSeriesType::Deterministic),
+)?;
+// A caller wanting exactly one checks that it got one -- there is no separate
+// resolver, so ambiguity is the caller's to name rather than the store's.
+let [meta] = &amp;rows[..] else { panic!("expected exactly one match: {rows:?}") };
+<span class="boring">}</span></code></pre></pre>
+<h2 id="per-timestamp-reads-simulation-loop"><a class="header" href="#per-timestamp-reads-simulation-loop">Per-Timestamp Reads (Simulation Loop)</a></h2>
+<p>The layout is optimized for "every component's value at one timestamp", and a <strong>reader</strong> is the API
+for that. Build one once outside the loop, then step it; the buffers are reused, so a tight loop
+allocates nothing. A reader is a passive plan — it does not borrow the <code>Store</code>, so the read goes
+through <code>Store::static_read</code> / <code>Store::forecast_read</code>, which fill it. See
+<a href="../explanation/readers.html">Readers</a> for the concepts.</p>
+<h3 id="static-series"><a class="header" href="#static-series">Static series</a></h3>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use infrastore_core::{ListFilter, TimeSeriesType};
+
+let mut reader = store.build_static_reader(ListFilter::new().resolution(Duration::hours(1)))?;
+for at in reader.timestamps().collect::&lt;Vec&lt;_&gt;&gt;() {
+    store.static_read(&amp;mut reader, at)?;
+    for group in reader.groups() {
+        let bytes = group.values();   // [num_columns, *element_shape], row-major LE
+        // group.keys()[j] identifies column j; group.dtype(), group.element_shape()
+    }
+}
+<span class="boring">}</span></code></pre></pre>
+<p><code>build_static_reader</code> covers both static types, and the filter decides what must hold:
+<code>SingleTimeSeries</code> (the default) must pin a resolution and share one grid; <code>NonSequentialTimeSeries</code>
+must pin <strong>no</strong> resolution — <code>reader.resolution()</code> is then <code>None</code> — and its columns must lie on one
+timestamp vector:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let mut reader = store.build_static_reader(
+    ListFilter::new().time_series_type(TimeSeriesType::NonSequentialTimeSeries),
 )?;
 <span class="boring">}</span></code></pre></pre>
+<p>Whatever the kind, <code>reader.timestamps()</code> walks the timeline, so the loop body above is unchanged.
+Coherence is validated at <strong>build</strong> time, where the error can name the series that disagree — there
+is no presence mask, and <code>static_read</code> errors rather than clamps on an off-grid instant.</p>
+<p>When the matched <code>SingleTimeSeries</code> share no grid, name the span instead of inheriting one.
+<code>build_static_reader_over</code> gives each column an offset of its own, so ragged series sweep together:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use infrastore_core::ReadWindow;
+
+let mut reader = store.build_static_reader_over(
+    ListFilter::new().resolution(Duration::hours(1)),
+    ReadWindow::from(anchor),   // .with_len(n) to pin the extent
+)?;
+<span class="boring">}</span></code></pre></pre>
+<p>Without a <code>len</code> the reader runs as far from the anchor as every matched series reaches. With one, a
+series that does not cover the span is an error naming it.</p>
+<p>When the odd series out should not take part at all, filter to one grid instead —
+<code>ListFilter::initial_timestamp</code> and <code>ListFilter::length</code> match only the series already on it:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let mut reader = store.build_static_reader(
+    ListFilter::new().resolution(Duration::hours(1)).initial_timestamp(anchor).length(8784),
+)?;
+<span class="boring">}</span></code></pre></pre>
+<p>See the <a href="../reference/rust-api.html#readers">Rust API reference</a> for how the two remedies differ.</p>
+<h3 id="forecasts-1"><a class="header" href="#forecasts-1">Forecasts</a></h3>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let mut reader = store.build_forecast_reader(
+    ListFilter::new()
+        .time_series_type(TimeSeriesType::Deterministic)
+        .resolution(Duration::hours(1)),
+)?;
+for k in 0..reader.count() {
+    let at = reader.interval().add_to(reader.initial_timestamp(), k as i64).unwrap();
+    store.forecast_read(&amp;mut reader, at)?;
+    for (i, entry) in reader.entries().iter().enumerate() {
+        let slot = reader.entry_slot(i);
+        let bytes = slot.window();    // window of slot.window_shape(), row-major LE
+        // entry.id() names the forecast; get_metadata_by_id resolves its owner
+    }
+}
+<span class="boring">}</span></code></pre></pre>
+<p>Entries that reference the same array and slice it the same way share one <code>WindowSlot</code>, and
+<code>forecast_read</code> performs one backend read per <strong>slot</strong> — so a forecast shared by a hundred owners is
+decompressed once per step. Dedup your own per-entry work by slot the same way. Note that
+<code>entry_slot(i)</code> takes the <em>entry</em> index, while <code>entry.slot()</code> is that slot's index into <code>slots()</code>.</p>
 <h2 id="copy-remove-and-maintain"><a class="header" href="#copy-remove-and-maintain">Copy, Remove, and Maintain</a></h2>
 <p><code>copy_time_series</code> re-points an existing association at another owner, optionally renaming it. It
 writes a metadata row only — arrays are content-addressed, so no data is duplicated — and it
@@ -455,25 +651,25 @@ produce):</p>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
 </span>let copied = store.copy_time_series(
-    key.identity(),
+    id,
     99,                    // dst_owner_id
     "Generator",           // dst_owner_type
     Some("load_copy"),     // new_name; None keeps the source name
-)?;
+)?;                        // returns the copy's own id; the source's is untouched
 <span class="boring">}</span></code></pre></pre>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>store.remove_time_series(key.identity())?;   // one series
+</span>store.remove_by_ids(&amp;[id])?;           // one series, or many in one transaction
 // The owner is the (owner_id, owner_category) pair.
 store.clear_time_series(Some((42, OwnerCategory::Component)))?;  // all series for an owner
 store.clear_time_series(None)?;        // everything
 
 let report = store.compact()?;         // reports reusable slots
-let integrity = store.verify_integrity()?;  // arrays only; catalog not checked
+let integrity = store.verify_integrity()?;  // stored content vs. the hashes the catalog names
 assert!(integrity.errors.is_empty());
 <span class="boring">}</span></code></pre></pre>
 <p>Removal is <a href="../explanation/content-addressing.html#deletion-is-reference-counted">reference-counted</a>:
-a shared array survives until its last referencing key is gone. <code>count_array_references(&amp;hash)</code>
+a shared array survives until its last referencing row is gone. <code>count_array_references(&amp;hash)</code>
 returns the <code>(SingleTimeSeries, DeterministicSingleTimeSeries)</code> association counts on one array,
 which is how you tell whether removing a <code>SingleTimeSeries</code> would orphan a forecast derived from it.</p>
 <h2 id="associations"><a class="header" href="#associations">Associations</a></h2>
@@ -566,10 +762,10 @@ assert_eq!(updated, 1);
 <p><code>persist_to</code> writes the whole store to a new path — both halves of the artifact, <code>path</code> and
 <code>&lt;path&gt;.sqlite</code>, overwriting anything already there. It works for an on-disk store (it flushes and
 copies the pair) <em>and</em> for an in-memory store, which is how you materialize a scratch store built
-with <code>create_store(None, true)</code>:</p>
+with <code>Store::create(None, true)</code>:</p>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>let mut store = create_store(None, true)?;   // in-memory
+</span>let mut store = Store::create(None, true)?;   // in-memory
 // ... add series ...
 store.persist_to(Path::new("system.h5"))?;   // writes system.h5 + system.h5.sqlite
 <span class="boring">}</span></code></pre></pre>
@@ -580,7 +776,7 @@ store.persist_to(Path::new("system.h5"))?;   // writes system.h5 + system.h5.sql
 </span><span class="boring">fn main() {
 </span>use infrastore_core::TimeSeriesError;
 
-match store.get_time_series(key.identity(), None) {
+match store.read_by_id(id, ReadWindow::full()) {
     Ok(data) =&gt; { /* ... */ }
     Err(TimeSeriesError::NotFound) =&gt; { /* missing */ }
     Err(TimeSeriesError::ReadOnlyStore) =&gt; unreachable!("this is a read"),
