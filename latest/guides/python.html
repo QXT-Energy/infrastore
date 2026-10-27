@@ -403,6 +403,11 @@ cannot afford another machine's choice does not inherit it. Lowering it mid-tran
 whatever the buffer already holds beyond the new figure; zero raises <code>InvalidParameterError</code>, since
 a pool's width floors at one column and a zero budget would mean a dataset per array rather than no
 buffering at all. The chunk-row ceiling above it does not move.</p>
+<p>The same figure bounds a rewrite. <code>persist_to</code>, <code>persist_arrays_to</code> and <code>compact</code> read and write
+each packed pool in blocks of at most this many bytes, so a pool wider than the budget lands as
+several datasets rather than one — including when the store being persisted is in memory. A block is
+never narrower than one column, so a single column larger than the budget is still read and written
+whole.</p>
 <h2 id="read-a-series"><a class="header" href="#read-a-series">Read a Series</a></h2>
 <pre><code class="language-python">got = store.read_by_id(series_id)
 assert np.array_equal(np.asarray(got.data), np.asarray(ts.data))
@@ -418,14 +423,23 @@ to what is there:</p>
     ),
 )
 </code></pre>
-<p><code>read_by_id</code> takes the other kind of slice: <code>start_time</code> plus a <code>len</code> of timesteps or a <code>count</code> of
-windows, <strong>checked</strong> rather than clipped, so an over-long request raises rather than quietly
-returning less.</p>
+<p><code>read_by_id</code> and <code>read_by_ids</code> also take a strict window rather than clipped bounds. <code>len</code> counts
+static timesteps and <code>count</code> counts forecast windows. The batch form applies that window to every id
+and preserves order and repeats. <code>start_time</code> is optional. Without it, each row starts at its own
+beginning, so mixed zoneless and aware series are allowed. A named off-grid start, a spelling
+mismatch, or a window longer than any selected series raises instead of quietly returning less.</p>
 <p>To read <strong>many whole series at once</strong> — e.g. loading everything for a plot — <code>read_by_ids</code> takes a
-list of ids and returns the typed series objects in the same order. Packed <code>SingleTimeSeries</code> are
-read in one decompress-once pass per dataset, which is much faster than a <code>read_by_id</code> each:</p>
-<pre><code class="language-python">series = store.read_by_ids(ids)
-window = store.read_by_ids_range(ids, (start, end))   # the same clip on every series
+list of ids and returns the typed series objects in the same order. Whole-series calls batch packed
+<code>SingleTimeSeries</code> in one decompress-once pass per dataset, which is much faster than a <code>read_by_id</code>
+each. A strict window still fetches metadata in one query, but currently reads each requested slice
+separately, including repeated ids. The whole-series performance guarantee does not apply to a
+windowed call:</p>
+<pre><code class="language-python">ids = [series_id]
+start = datetime(2024, 1, 1, 6, tzinfo=timezone.utc)
+end = datetime(2024, 1, 1, 12, tzinfo=timezone.utc)
+series = store.read_by_ids(ids)
+window = store.read_by_ids_range(ids, (start, end))
+strict = store.read_by_ids(ids, start_time=start, len=6)  # exactly six steps from start
 </code></pre>
 <h3 id="as-a-table"><a class="header" href="#as-a-table">As a table</a></h3>
 <p>A read hands back the values as a numpy array with the timeline beside it, not fused into it. When
@@ -472,8 +486,8 @@ timestamps, rows that leave a declared grid, decoded <code>struct</code>/<code>l
 <a href="../reference/python-api.html#from_arrow">reference</a>.</p>
 <p><code>to_arrow()</code> and <code>from_arrow()</code> are <strong>per-series, in-memory conveniences</strong> -- one series, one table.
 They are not the CLI's file format: <code>infrastore export -f parquet</code> writes
-<a href="../reference/parquet-format.html">a values/series file pair per partition</a>, each distinct array once
-and one catalog row per series, which <code>from_arrow</code> does not read. To move a whole store through
+<a href="../reference/parquet-format.html">a values/series/arrays file set per partition</a>, each distinct array
+once and one catalog row per series, which <code>from_arrow</code> does not read. To move a whole store through
 Parquet, use the CLI at both ends.</p>
 <h3 id="datetimes-and-precision"><a class="header" href="#datetimes-and-precision">Datetimes and precision</a></h3>
 <p>Every <code>datetime</code> must be timezone-aware (any zone; converted to UTC on the way in, UTC on the way
